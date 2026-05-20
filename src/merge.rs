@@ -96,9 +96,20 @@ pub fn merge(
     let mut entries: Vec<CrapEntry> = complexity
         .into_iter()
         .filter_map(|fc| {
-            let cov = index
-                .lookup(&fc.file)
-                .map(|cov_file| cov_file.coverage_in_span(fc.start_line, fc.end_line));
+            let cov_file = index.lookup(&fc.file);
+            let cov = cov_file.map(|cf| cf.coverage_in_span(fc.start_line, fc.end_line));
+
+            // If this function is cfg-gated and the file IS in the LCOV
+            // report but has zero instrumented lines in the function's
+            // span, the function was parsed by `syn` but never compiled
+            // (the active cfg selected the other variant). Exclude it to
+            // avoid a misleading 100% coverage / low-CRAP entry.
+            if fc.cfg_gated
+                && let Some(cf) = cov_file
+                && !cf.has_lines_in_span(fc.start_line, fc.end_line)
+            {
+                return None;
+            }
 
             if has_coverage {
                 if cov.is_some() {
@@ -299,6 +310,7 @@ mod tests {
                 start_line: 1,
                 end_line: 3,
                 cyclomatic: 1.0,
+                cfg_gated: false,
             },
             FunctionComplexity {
                 file: PathBuf::from("a.rs"),
@@ -306,6 +318,7 @@ mod tests {
                 start_line: 10,
                 end_line: 30,
                 cyclomatic: 10.0,
+                cfg_gated: false,
             },
         ];
         let result = merge(
@@ -325,6 +338,7 @@ mod tests {
             start_line: 1,
             end_line: 5,
             cyclomatic: 3.0,
+            cfg_gated: false,
         }];
         let result = merge(complexity, HashMap::new(), MissingCoveragePolicy::Skip);
         assert!(result.entries.is_empty());
@@ -372,6 +386,7 @@ mod tests {
                 start_line: 1,
                 end_line: 3,
                 cyclomatic: 1.0,
+                cfg_gated: false,
             },
             FunctionComplexity {
                 file: PathBuf::from("/project/src/bar.rs"),
@@ -379,6 +394,7 @@ mod tests {
                 start_line: 1,
                 end_line: 3,
                 cyclomatic: 1.0,
+                cfg_gated: false,
             },
         ];
 
@@ -397,6 +413,7 @@ mod tests {
             start_line: 1,
             end_line: 3,
             cyclomatic: 1.0,
+            cfg_gated: false,
         }];
         let result = merge(
             complexity,
@@ -406,6 +423,104 @@ mod tests {
         assert!(
             result.unmapped_files.is_empty(),
             "no lcov → no unmapped warnings"
+        );
+    }
+
+    #[test]
+    fn cfg_gated_function_excluded_when_no_lcov_lines_in_span() {
+        // Two cfg-gated variants of the same function in the same file.
+        // The LCOV file has DA records only for the first variant's span
+        // (lines 2–4). The second variant's span (lines 7–9) has no DA
+        // records at all — it was not compiled.
+        let mut cov_map = HashMap::new();
+        cov_map.insert(
+            PathBuf::from("src/lib.rs"),
+            cov_with(&[(2, 5), (3, 5), (4, 5)]),
+        );
+
+        let complexity = vec![
+            FunctionComplexity {
+                file: PathBuf::from("/project/src/lib.rs"),
+                name: "do_thing".into(),
+                start_line: 1,
+                end_line: 5,
+                cyclomatic: 2.0,
+                cfg_gated: true,
+            },
+            FunctionComplexity {
+                file: PathBuf::from("/project/src/lib.rs"),
+                name: "do_thing".into(),
+                start_line: 7,
+                end_line: 10,
+                cyclomatic: 3.0,
+                cfg_gated: true,
+            },
+        ];
+
+        let result = merge(complexity, cov_map, MissingCoveragePolicy::Pessimistic);
+        assert_eq!(
+            result.entries.len(),
+            1,
+            "only the compiled cfg variant should appear"
+        );
+        assert_eq!(
+            result.entries[0].line, 1,
+            "the compiled variant starts at line 1"
+        );
+    }
+
+    #[test]
+    fn non_cfg_function_with_no_lcov_lines_kept_at_100() {
+        // A non-cfg-gated function with no DA lines in its span should
+        // still appear with 100% coverage (existing behavior for
+        // declarative-only functions).
+        let mut cov_map = HashMap::new();
+        cov_map.insert(
+            PathBuf::from("src/lib.rs"),
+            cov_with(&[(50, 1)]), // DA lines elsewhere in the file
+        );
+
+        let complexity = vec![FunctionComplexity {
+            file: PathBuf::from("/project/src/lib.rs"),
+            name: "declarative_fn".into(),
+            start_line: 1,
+            end_line: 3,
+            cyclomatic: 1.0,
+            cfg_gated: false,
+        }];
+
+        let result = merge(complexity, cov_map, MissingCoveragePolicy::Pessimistic);
+        assert_eq!(
+            result.entries.len(),
+            1,
+            "non-cfg function must be kept even with no DA lines"
+        );
+        assert_eq!(result.entries[0].coverage, Some(100.0));
+    }
+
+    #[test]
+    fn cfg_gated_function_kept_when_file_absent_from_lcov() {
+        // When the entire file is absent from the LCOV, cfg_gated does not
+        // change the missing-coverage policy. The function should be treated
+        // normally (pessimistic → 0%).
+        let complexity = vec![FunctionComplexity {
+            file: PathBuf::from("/project/src/platform.rs"),
+            name: "platform_fn".into(),
+            start_line: 1,
+            end_line: 5,
+            cyclomatic: 2.0,
+            cfg_gated: true,
+        }];
+
+        let result = merge(
+            complexity,
+            HashMap::new(),
+            MissingCoveragePolicy::Pessimistic,
+        );
+        assert_eq!(
+            result.entries.len(),
+            1,
+            "cfg_gated fn must be kept when file is not in LCOV"
         );
     }
 }

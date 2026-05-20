@@ -144,23 +144,28 @@ fn build_pass_one_entry(
     }
 }
 
-/// Pass 1 — exact `(file_path, function_name)` match. Returns the entry
-/// list (some still `New`, awaiting pass 2) and the set of baseline keys
-/// that were matched (so pass 2 / removed-collection can skip them).
+/// Pass 1 — exact `(file_path, function_name, start_line)` match. Returns
+/// the entry list (some still `New`, awaiting pass 2) and the set of baseline
+/// keys that were matched (so pass 2 / removed-collection can skip them).
+///
+/// Including `start_line` in the key prevents silent `HashMap` collisions when
+/// two entries share the same file and function name (e.g. cfg-gated variants
+/// at different line spans, or same-named functions in different scopes that
+/// resolve to the same qualified name).
 fn pass_one_exact(
     current: &[CrapEntry],
     baseline: &[CrapEntry],
     epsilon: f64,
-) -> (Vec<DeltaEntry>, HashSet<(String, String)>) {
-    let baseline_index: HashMap<(String, String), &CrapEntry> = baseline
+) -> (Vec<DeltaEntry>, HashSet<(String, String, usize)>) {
+    let baseline_index: HashMap<(String, String, usize), &CrapEntry> = baseline
         .iter()
-        .map(|e| ((path_key(&e.file), e.function.clone()), e))
+        .map(|e| ((path_key(&e.file), e.function.clone(), e.line), e))
         .collect();
-    let mut matched: HashSet<(String, String)> = HashSet::new();
+    let mut matched: HashSet<(String, String, usize)> = HashSet::new();
     let entries = current
         .iter()
         .map(|e| {
-            let key = (path_key(&e.file), e.function.clone());
+            let key = (path_key(&e.file), e.function.clone(), e.line);
             let baseline_entry = baseline_index.get(&key).copied();
             if baseline_entry.is_some() {
                 matched.insert(key);
@@ -195,7 +200,7 @@ fn apply_move_pairing(
 fn pass_two_name_fallback(
     entries: &mut [DeltaEntry],
     baseline: &[CrapEntry],
-    matched: &mut HashSet<(String, String)>,
+    matched: &mut HashSet<(String, String, usize)>,
     epsilon: f64,
 ) {
     let mut new_idx_by_name: HashMap<String, Vec<usize>> = HashMap::new();
@@ -209,7 +214,7 @@ fn pass_two_name_fallback(
     }
     let mut baseline_unmatched_by_name: HashMap<String, Vec<&CrapEntry>> = HashMap::new();
     for e in baseline {
-        let key = (path_key(&e.file), e.function.clone());
+        let key = (path_key(&e.file), e.function.clone(), e.line);
         if !matched.contains(&key) {
             baseline_unmatched_by_name
                 .entry(e.function.clone())
@@ -232,6 +237,7 @@ fn pass_two_name_fallback(
         matched.insert((
             path_key(&baseline_entry.file),
             baseline_entry.function.clone(),
+            baseline_entry.line,
         ));
     }
 }
@@ -239,11 +245,11 @@ fn pass_two_name_fallback(
 /// Collect baseline entries with no surviving pair into [`RemovedEntry`]s.
 fn collect_removed(
     baseline: &[CrapEntry],
-    matched: &HashSet<(String, String)>,
+    matched: &HashSet<(String, String, usize)>,
 ) -> Vec<RemovedEntry> {
     baseline
         .iter()
-        .filter(|e| !matched.contains(&(path_key(&e.file), e.function.clone())))
+        .filter(|e| !matched.contains(&(path_key(&e.file), e.function.clone(), e.line)))
         .map(|e| RemovedEntry {
             function: e.function.clone(),
             file: e.file.clone(),
@@ -704,5 +710,71 @@ mod tests {
         // a genuine deletion.
         assert_eq!(report.removed.len(), 1);
         assert_eq!(report.removed[0].file, PathBuf::from("src/b.rs"));
+    }
+
+    #[test]
+    fn same_name_different_lines_not_shadowed_in_pass_one() {
+        // Two entries in the same file with the same function name but
+        // different start lines (e.g. cfg-gated variants). The pass-1
+        // HashMap must index them separately — previously, the (file, name)
+        // key caused the second entry to shadow the first.
+        let baseline = vec![
+            CrapEntry {
+                file: PathBuf::from("src/lib.rs"),
+                function: "do_thing".into(),
+                line: 10,
+                cyclomatic: 2.0,
+                coverage: Some(80.0),
+                crap: 3.0,
+                crate_name: None,
+            },
+            CrapEntry {
+                file: PathBuf::from("src/lib.rs"),
+                function: "do_thing".into(),
+                line: 25,
+                cyclomatic: 4.0,
+                coverage: Some(60.0),
+                crap: 8.0,
+                crate_name: None,
+            },
+        ];
+        let current = vec![
+            CrapEntry {
+                file: PathBuf::from("src/lib.rs"),
+                function: "do_thing".into(),
+                line: 10,
+                cyclomatic: 2.0,
+                coverage: Some(80.0),
+                crap: 3.0,
+                crate_name: None,
+            },
+            CrapEntry {
+                file: PathBuf::from("src/lib.rs"),
+                function: "do_thing".into(),
+                line: 25,
+                cyclomatic: 4.0,
+                coverage: Some(60.0),
+                crap: 8.0,
+                crate_name: None,
+            },
+        ];
+        let report = compute_delta(&current, &baseline, DEFAULT_EPSILON);
+        // Both entries should match their baseline counterparts — neither
+        // should be New or Removed.
+        assert_eq!(report.entries.len(), 2);
+        for de in &report.entries {
+            assert_eq!(
+                de.status,
+                DeltaStatus::Unchanged,
+                "entry at line {} should be Unchanged, got {:?}",
+                de.current.line,
+                de.status
+            );
+        }
+        assert!(
+            report.removed.is_empty(),
+            "no baseline entries should be orphaned, got {} removed",
+            report.removed.len()
+        );
     }
 }
