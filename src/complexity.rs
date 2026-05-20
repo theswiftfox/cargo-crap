@@ -30,6 +30,11 @@ pub struct FunctionComplexity {
     pub end_line: usize,
     /// `McCabe` cyclomatic complexity, minimum 1.0.
     pub cyclomatic: f64,
+    /// `true` when this function (or an enclosing `impl` / inline `mod`)
+    /// carries a `#[cfg(...)]` attribute other than `#[cfg(test)]`.
+    /// Used by the merge layer to detect functions that were parsed by `syn`
+    /// but never compiled — their LCOV spans will be empty.
+    pub cfg_gated: bool,
 }
 
 /// Analyze a single Rust source file and return every function found.
@@ -48,6 +53,7 @@ pub fn analyze_file(path: &Path) -> Result<Vec<FunctionComplexity>> {
         out: Vec::new(),
         impl_type: None,
         mod_path: Vec::new(),
+        cfg_depth: 0,
     };
     visitor.visit_file(&syntax);
     Ok(visitor.out)
@@ -72,6 +78,19 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
+/// Returns `true` if `attrs` contains any `#[cfg(...)]` attribute that is NOT
+/// `#[cfg(test)]`.
+///
+/// This detects feature-flag guards (`#[cfg(feature = "...")]`), platform
+/// guards (`#[cfg(target_os = "...")]`), and arbitrary predicate forms. The
+/// `#[cfg(test)]` form is excluded because it is already handled by skipping
+/// the entire `#[cfg(test)]` module.
+fn has_non_test_cfg(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        a.path().is_ident("cfg") && !a.parse_args::<syn::Ident>().is_ok_and(|id| id == "test")
+    })
+}
+
 /// Extract a simple type name from an `impl` self-type for use as a prefix.
 ///
 /// `impl Foo` and `impl Trait for Foo` both yield `Some("Foo")`.
@@ -93,6 +112,10 @@ struct FunctionVisitor<'a> {
     /// Stack of enclosing `mod` names, built up as the visitor descends into
     /// inline modules. Produces qualified names like `outer::inner::func`.
     mod_path: Vec<String>,
+    /// How many enclosing scopes (impl blocks, inline modules) carry a
+    /// `#[cfg(...)]` attribute (excluding `#[cfg(test)]`). Any function
+    /// emitted while `cfg_depth > 0` inherits `cfg_gated = true`.
+    cfg_depth: usize,
 }
 
 impl FunctionVisitor<'_> {
@@ -129,12 +152,14 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         let start_line = node.sig.fn_token.span.start().line;
         let end_line = node.block.brace_token.span.close().end().line;
         let cyclomatic = count_cyclomatic(&node.block) as f64;
+        let cfg_gated = self.cfg_depth > 0 || has_non_test_cfg(&node.attrs);
         self.out.push(FunctionComplexity {
             file: self.file.to_path_buf(),
             name,
             start_line,
             end_line,
             cyclomatic,
+            cfg_gated,
         });
         // Do NOT recurse: skip nested fn items inside function bodies.
     }
@@ -147,7 +172,14 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         // visit_impl_item_fn can prefix method names with it.
         let prev = self.impl_type.take();
         self.impl_type = impl_type_name(&node.self_ty);
+        let is_cfg = has_non_test_cfg(&node.attrs);
+        if is_cfg {
+            self.cfg_depth += 1;
+        }
         visit::visit_item_impl(self, node);
+        if is_cfg {
+            self.cfg_depth -= 1;
+        }
         self.impl_type = prev;
     }
 
@@ -162,12 +194,14 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         let start_line = node.sig.fn_token.span.start().line;
         let end_line = node.block.brace_token.span.close().end().line;
         let cyclomatic = count_cyclomatic(&node.block) as f64;
+        let cfg_gated = self.cfg_depth > 0 || has_non_test_cfg(&node.attrs);
         self.out.push(FunctionComplexity {
             file: self.file.to_path_buf(),
             name,
             start_line,
             end_line,
             cyclomatic,
+            cfg_gated,
         });
     }
 
@@ -178,9 +212,16 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         // Skip the entire #[cfg(test)] module — functions inside it will
         // never appear in coverage reports and would all score pessimistically.
         if !is_cfg_test(&node.attrs) {
+            let is_cfg = has_non_test_cfg(&node.attrs);
+            if is_cfg {
+                self.cfg_depth += 1;
+            }
             self.mod_path.push(node.ident.to_string());
             visit::visit_item_mod(self, node);
             self.mod_path.pop();
+            if is_cfg {
+                self.cfg_depth -= 1;
+            }
         }
     }
 }
@@ -745,5 +786,135 @@ mod engine {
         let fns = analyze_file(f.path()).expect("analyze");
         assert_eq!(fns.len(), 1);
         assert_eq!(fns[0].name, "engine::Core::start");
+    }
+
+    #[test]
+    fn plain_function_is_not_cfg_gated() {
+        let f = write_temp("fn plain() -> i32 { 42 }");
+        let fns = analyze_file(f.path()).expect("analyze");
+        assert_eq!(fns.len(), 1);
+        assert!(!fns[0].cfg_gated, "plain fn must not be cfg_gated");
+    }
+
+    #[test]
+    fn cfg_feature_on_function_sets_cfg_gated() {
+        let f = write_temp(
+            r#"
+#[cfg(feature = "foo")]
+fn feature_fn() -> i32 { 42 }
+"#,
+        );
+        let fns = analyze_file(f.path()).expect("analyze");
+        assert_eq!(fns.len(), 1);
+        assert!(
+            fns[0].cfg_gated,
+            "#[cfg(feature = ...)] fn must be cfg_gated"
+        );
+    }
+
+    #[test]
+    fn cfg_target_os_on_function_sets_cfg_gated() {
+        let f = write_temp(
+            r#"
+#[cfg(target_os = "linux")]
+fn linux_only() -> i32 { 42 }
+"#,
+        );
+        let fns = analyze_file(f.path()).expect("analyze");
+        assert_eq!(fns.len(), 1);
+        assert!(
+            fns[0].cfg_gated,
+            "#[cfg(target_os = ...)] fn must be cfg_gated"
+        );
+    }
+
+    #[test]
+    fn cfg_on_impl_block_propagates_to_methods() {
+        let f = write_temp(
+            r#"
+struct Foo;
+#[cfg(feature = "bar")]
+impl Foo {
+    fn method(&self) -> i32 { 1 }
+}
+"#,
+        );
+        let fns = analyze_file(f.path()).expect("analyze");
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "Foo::method");
+        assert!(
+            fns[0].cfg_gated,
+            "method inside #[cfg] impl must be cfg_gated"
+        );
+    }
+
+    #[test]
+    fn cfg_on_module_propagates_to_functions() {
+        let f = write_temp(
+            r#"
+#[cfg(feature = "extra")]
+mod platform {
+    pub fn setup() -> i32 { 1 }
+}
+"#,
+        );
+        let fns = analyze_file(f.path()).expect("analyze");
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "platform::setup");
+        assert!(fns[0].cfg_gated, "fn inside #[cfg] mod must be cfg_gated");
+    }
+
+    #[test]
+    fn cfg_on_nested_module_propagates() {
+        let f = write_temp(
+            r#"
+#[cfg(feature = "x")]
+mod outer {
+    mod inner {
+        pub fn deep() -> i32 { 42 }
+    }
+}
+"#,
+        );
+        let fns = analyze_file(f.path()).expect("analyze");
+        assert_eq!(fns.len(), 1);
+        assert!(
+            fns[0].cfg_gated,
+            "fn nested inside #[cfg] mod must be cfg_gated"
+        );
+    }
+
+    #[test]
+    fn non_cfg_impl_does_not_set_cfg_gated() {
+        let f = write_temp(
+            r"
+struct Bar;
+impl Bar {
+    fn method(&self) -> i32 { 1 }
+}
+",
+        );
+        let fns = analyze_file(f.path()).expect("analyze");
+        assert_eq!(fns.len(), 1);
+        assert!(
+            !fns[0].cfg_gated,
+            "method inside plain impl must not be cfg_gated"
+        );
+    }
+
+    #[test]
+    fn cfg_not_feature_on_function_sets_cfg_gated() {
+        let f = write_temp(
+            r#"
+#[cfg(not(feature = "foo"))]
+fn fallback() -> i32 { 0 }
+"#,
+        );
+        let fns = analyze_file(f.path()).expect("analyze");
+        assert_eq!(fns.len(), 1);
+        assert!(
+            fns[0].cfg_gated,
+            "#[cfg(not(feature = ...))] fn must be cfg_gated"
+        );
     }
 }

@@ -61,6 +61,25 @@ impl FileCoverage {
         let covered = executable.iter().filter(|(_, hits)| **hits > 0).count();
         (covered as f64 / executable.len() as f64) * 100.0
     }
+
+    /// Returns `true` if the LCOV data contains any `DA` records within the
+    /// line range `[start..=end]`.
+    ///
+    /// This distinguishes "not compiled" (no instrumented lines at all, as
+    /// happens with `#[cfg]`-gated code) from "compiled but all-declarative"
+    /// (which also has no `DA` lines but for a different reason). The merge
+    /// layer uses this to suppress cfg-gated functions whose variant was not
+    /// compiled.
+    #[must_use]
+    pub fn has_lines_in_span(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> bool {
+        let start = start as u32;
+        let end = end as u32;
+        self.lines.range(start..=end).next().is_some()
+    }
 }
 
 /// Parse an LCOV file into a map keyed by the source paths it declares.
@@ -250,5 +269,23 @@ mod tests {
         let fc = fc_from(&[(5, 1), (10, 1), (15, 1)]);
         // Only line 10 is inside [10..=10].
         assert_eq!(fc.coverage_in_span(10, 10), 100.0);
+    }
+
+    #[test]
+    fn has_lines_in_span_true_when_lines_exist() {
+        let fc = fc_from(&[(10, 0), (11, 3)]);
+        assert!(fc.has_lines_in_span(10, 15));
+    }
+
+    #[test]
+    fn has_lines_in_span_false_when_no_lines_in_range() {
+        let fc = fc_from(&[(5, 1), (25, 1)]);
+        assert!(!fc.has_lines_in_span(10, 20));
+    }
+
+    #[test]
+    fn has_lines_in_span_false_on_empty_coverage() {
+        let fc = fc_from(&[]);
+        assert!(!fc.has_lines_in_span(1, 100));
     }
 }

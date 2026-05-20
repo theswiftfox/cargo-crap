@@ -121,3 +121,67 @@ fn json_output_round_trips() {
         "envelope must contain an `entries` array"
     );
 }
+
+fn cfg_gated_fixture_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cfg_gated_project")
+}
+
+#[test]
+fn cfg_gated_uncompiled_variant_excluded_from_output() {
+    let root = cfg_gated_fixture_root();
+
+    // 1. Complexity pass — syn sees BOTH cfg-gated variants of do_thing.
+    let complexity =
+        complexity::analyze_tree(&root.join("src"), &[] as &[&str]).expect("analyze_tree");
+    let do_thing_count = complexity.iter().filter(|f| f.name == "do_thing").count();
+    assert_eq!(
+        do_thing_count, 2,
+        "syn should parse both cfg variants of do_thing, found {do_thing_count}"
+    );
+
+    // Verify that both cfg variants are detected as cfg_gated.
+    for fc in complexity.iter().filter(|f| f.name == "do_thing") {
+        assert!(
+            fc.cfg_gated,
+            "do_thing at line {} should be cfg_gated",
+            fc.start_line
+        );
+    }
+
+    // always_here should NOT be cfg_gated.
+    let always = complexity
+        .iter()
+        .find(|f| f.name == "always_here")
+        .expect("always_here must exist");
+    assert!(!always.cfg_gated, "always_here should not be cfg_gated");
+
+    // 2. Parse the fixture LCOV — only has DA records for the first variant.
+    let coverage = coverage::parse_lcov(&root.join("lcov.info")).expect("parse_lcov");
+
+    // 3. Merge — the uncompiled variant should be excluded.
+    let entries = merge(complexity, coverage, MissingCoveragePolicy::Pessimistic).entries;
+
+    let do_thing_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| e.function == "do_thing")
+        .collect();
+    assert_eq!(
+        do_thing_entries.len(),
+        1,
+        "only the compiled cfg variant should survive merge, got {}",
+        do_thing_entries.len()
+    );
+
+    // The surviving entry should be the first variant (whose lines have DA records).
+    let surviving = &do_thing_entries[0];
+    assert!(
+        surviving.coverage.is_some(),
+        "surviving variant must have coverage data"
+    );
+
+    // always_here should also be present.
+    assert!(
+        entries.iter().any(|e| e.function == "always_here"),
+        "always_here must appear in output"
+    );
+}
