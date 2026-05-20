@@ -47,6 +47,7 @@ pub fn analyze_file(path: &Path) -> Result<Vec<FunctionComplexity>> {
         file: path,
         out: Vec::new(),
         impl_type: None,
+        mod_path: Vec::new(),
     };
     visitor.visit_file(&syntax);
     Ok(visitor.out)
@@ -89,6 +90,29 @@ struct FunctionVisitor<'a> {
     out: Vec<FunctionComplexity>,
     /// Type name of the enclosing `impl` block, if any.
     impl_type: Option<String>,
+    /// Stack of enclosing `mod` names, built up as the visitor descends into
+    /// inline modules. Produces qualified names like `outer::inner::func`.
+    mod_path: Vec<String>,
+}
+
+impl FunctionVisitor<'_> {
+    /// Build a fully-qualified function name by prepending the current module
+    /// path and optional impl type. Examples:
+    ///
+    /// - Top-level free function: `"foo"`
+    /// - `mod a { fn foo() }` → `"a::foo"`
+    /// - `mod a { impl Bar { fn baz() } }` → `"a::Bar::baz"`
+    fn qualified_name(
+        &self,
+        bare: &str,
+    ) -> String {
+        let mut parts: Vec<&str> = self.mod_path.iter().map(String::as_str).collect();
+        if let Some(ty) = &self.impl_type {
+            parts.push(ty);
+        }
+        parts.push(bare);
+        parts.join("::")
+    }
 }
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
@@ -101,7 +125,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         if has_attr(&node.attrs, "test") {
             return;
         }
-        let name = node.sig.ident.to_string();
+        let name = self.qualified_name(&node.sig.ident.to_string());
         let start_line = node.sig.fn_token.span.start().line;
         let end_line = node.block.brace_token.span.close().end().line;
         let cyclomatic = count_cyclomatic(&node.block) as f64;
@@ -134,11 +158,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         if has_attr(&node.attrs, "test") {
             return;
         }
-        let method = node.sig.ident.to_string();
-        let name = match &self.impl_type {
-            Some(ty) => format!("{ty}::{method}"),
-            None => method,
-        };
+        let name = self.qualified_name(&node.sig.ident.to_string());
         let start_line = node.sig.fn_token.span.start().line;
         let end_line = node.block.brace_token.span.close().end().line;
         let cyclomatic = count_cyclomatic(&node.block) as f64;
@@ -158,7 +178,9 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         // Skip the entire #[cfg(test)] module — functions inside it will
         // never appear in coverage reports and would all score pessimistically.
         if !is_cfg_test(&node.attrs) {
+            self.mod_path.push(node.ident.to_string());
             visit::visit_item_mod(self, node);
+            self.mod_path.pop();
         }
     }
 }
@@ -577,8 +599,8 @@ mod inner {
         let fns = analyze_file(f.path()).expect("analyze");
         let names: Vec<_> = fns.iter().map(|fc| fc.name.as_str()).collect();
         assert!(
-            names.contains(&"in_module"),
-            "fn inside a plain mod must be included, got: {names:?}"
+            names.contains(&"inner::in_module"),
+            "fn inside a plain mod must be qualified, got: {names:?}"
         );
     }
 
@@ -598,7 +620,7 @@ mod extra {
         let fns = analyze_file(f.path()).expect("analyze");
         let names: Vec<_> = fns.iter().map(|fc| fc.name.as_str()).collect();
         assert!(
-            names.contains(&"feature_fn"),
+            names.contains(&"extra::feature_fn"),
             "#[cfg(feature = ...)] mod must not be skipped, got: {names:?}"
         );
     }
@@ -664,5 +686,64 @@ fn allowed() -> i32 { 42 }
         let dir = tempfile::tempdir().expect("tempdir");
         let result = analyze_tree(dir.path(), &["[invalid"]);
         assert!(result.is_err(), "invalid glob must return an error");
+    }
+
+    #[test]
+    fn duplicate_names_in_different_modules_are_qualified() {
+        // Two modules with identically-named functions must produce distinct
+        // qualified names so baseline matching can tell them apart.
+        let f = write_temp(
+            r"
+mod a {
+    pub fn test() -> i32 { 1 }
+}
+mod b {
+    pub fn test() -> i32 { 2 }
+}
+",
+        );
+        let fns = analyze_file(f.path()).expect("analyze");
+        let names: Vec<_> = fns.iter().map(|fc| fc.name.as_str()).collect();
+        assert!(
+            names.contains(&"a::test"),
+            "expected a::test, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"b::test"),
+            "expected b::test, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn nested_modules_produce_full_path() {
+        let f = write_temp(
+            r"
+mod outer {
+    mod inner {
+        pub fn deep() -> i32 { 42 }
+    }
+}
+",
+        );
+        let fns = analyze_file(f.path()).expect("analyze");
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "outer::inner::deep");
+    }
+
+    #[test]
+    fn impl_inside_module_is_qualified() {
+        let f = write_temp(
+            r"
+mod engine {
+    struct Core;
+    impl Core {
+        fn start(&self) -> bool { true }
+    }
+}
+",
+        );
+        let fns = analyze_file(f.path()).expect("analyze");
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name, "engine::Core::start");
     }
 }
