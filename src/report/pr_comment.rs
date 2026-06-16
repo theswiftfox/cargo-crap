@@ -297,6 +297,14 @@ fn write_pr_comment_breakdown(
     Ok(())
 }
 
+fn write_pr_comment_legend(out: &mut dyn Write) -> Result<()> {
+    writeln!(
+        out,
+        "✓ = clean, ▲ = moderate, ✗ = crappy; Δ = change since baseline; CC = cyclomatic complexity; Cov % = line coverage percentage"
+    )?;
+    Ok(())
+}
+
 fn write_pr_comment_primary(
     out: &mut dyn Write,
     b: &DeltaBuckets,
@@ -458,6 +466,7 @@ pub(crate) fn render_delta_pr_comment(
     let prefix = buckets.common_prefix();
     write_pr_comment_delta_headline(out, buckets.regressed.len())?;
     write_pr_comment_breakdown(out, &buckets, unchanged_count(report))?;
+    write_pr_comment_legend(out)?;
     write_pr_comment_primary(out, &buckets, threshold, &prefix, links)?;
     write_pr_comment_secondary_sections(out, &buckets, threshold, &prefix, links)
 }
